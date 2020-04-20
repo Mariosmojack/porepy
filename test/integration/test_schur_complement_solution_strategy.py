@@ -1,15 +1,16 @@
 """
-Integration tests for the Biot modell, with and without contact mechanics.
+Integration tests for the Schur Complement solution strategy.
 
-We have the full Biot equations in the matrix, and mass conservation and contact
-conditions in the fracture. For the contact mechanical part of this
-test, please refer to test_contact_mechanics.
+We have the full Biot/THM equations in the matrix and mass 
+(and energy) conservation and contact conditions in the fracture. 
+TODO: Add 3d test.
 """
 import numpy as np
 import unittest, pdb
 
 import porepy as pp
 import porepy.models.contact_mechanics_biot_model as model
+import porepy.models.thm_model as thm_model
 import test.common.contact_mechanics_examples
 
 
@@ -55,22 +56,8 @@ class TestSchurComplement(unittest.TestCase):
         )
         setup.mesh_args = nx.copy()
         setup.simplex = False
-        # setup.subtract_fracture_pressure = False
+
         u_mortar, contact_force, fracture_pressure = self._solve(setup)
-        # All components should be open in the normal direction
-        # self.assertTrue(np.all(u_mortar[1] < 0))
-
-        # By symmetry (reasonable to expect from this grid), the jump in tangential
-        # deformation should be zero.
-        # self.assertTrue(np.abs(np.sum(u_mortar[0])) < 1e-5)
-
-        # The contact force in normal direction should be zero
-
-        # NB: This assumes the contact force is expressed in local coordinates
-        # self.assertTrue(np.all(np.abs(contact_force) < 1e-7))
-
-        # Check that the dilation of the fracture yields a negative fracture pressure
-        # self.assertTrue(np.all(fracture_pressure < -1e-7))
         setup_SC = SetupContactMechanicsBiot(
             ux_south=0,
             uy_south=0,
@@ -86,6 +73,61 @@ class TestSchurComplement(unittest.TestCase):
         self.assertTrue(np.all(np.isclose(fracture_pressure_SC, fracture_pressure)))
         self.assertTrue(np.all(np.isclose(contact_force_SC, contact_force)))
 
+    def test_multiple_time_steps(self):
+        uy = 0.001
+        nx = 5
+        nx = [nx, nx]
+        setup = SetupContactMechanicsBiot(
+            ux_south=0, uy_south=0, ux_north=0, uy_north=uy
+        )
+        setup.mesh_args = nx.copy()
+        setup.simplex = False
+        setup.end_time *= 3
+        u_mortar, contact_force, fracture_pressure = self._solve(setup)
+        
+        setup_SC = SetupContactMechanicsBiot(
+            ux_south=0,
+            uy_south=0,
+            ux_north=0,
+            uy_north=uy,
+            solution_strategy="schur_complement",
+        )
+        setup_SC.mesh_args = nx
+        setup_SC.simplex = False
+        setup_SC.end_time *= 3
+        u_mortar_SC, contact_force_SC, fracture_pressure_SC = self._solve(setup_SC)
+
+        self.assertTrue(np.all(np.isclose(u_mortar_SC, u_mortar)))
+        self.assertTrue(np.all(np.isclose(fracture_pressure_SC, fracture_pressure)))
+        self.assertTrue(np.all(np.isclose(contact_force_SC, contact_force)))
+
+    def test_multiple_time_steps_thm(self):
+        uy = 0.001
+        nx = 15
+        nx = [nx, nx]
+        setup = SetupTHM(
+            ux_south=0, uy_south=0, ux_north=0, uy_north=uy
+        )
+        setup.mesh_args = nx.copy()
+        setup.simplex = False
+        setup.end_time *= 3
+        u_mortar, contact_force, fracture_pressure = self._solve(setup)
+        
+        setup_SC = SetupTHM(
+            ux_south=0,
+            uy_south=0,
+            ux_north=0,
+            uy_north=uy,
+            solution_strategy="schur_complement",
+        )
+        setup_SC.mesh_args = nx
+        setup_SC.simplex = False
+        setup_SC.end_time *= 3
+        u_mortar_SC, contact_force_SC, fracture_pressure_SC = self._solve(setup_SC)
+
+        self.assertTrue(np.all(np.isclose(u_mortar_SC, u_mortar)))
+        self.assertTrue(np.all(np.isclose(fracture_pressure_SC, fracture_pressure)))
+        self.assertTrue(np.all(np.isclose(contact_force_SC, contact_force)))
 
 class SetupContactMechanicsBiot(
     test.common.contact_mechanics_examples.ProblemDataTime, model.ContactMechanicsBiot
@@ -115,6 +157,33 @@ class SetupContactMechanicsBiot(
         self.scalar_source_value = source_value
 
 
+class SetupTHM(
+    test.common.contact_mechanics_examples.ProblemDataTime, thm_model.THM
+):
+    def __init__(
+        self,
+        ux_south,
+        uy_south,
+        ux_north,
+        uy_north,
+        solution_strategy=None,
+        source_value=0,
+    ):
+
+        self.mesh_args = {
+            "mesh_size_frac": 0.5,
+            "mesh_size_min": 0.023,
+            "mesh_size_bound": 0.5,
+        }
+        params = {"solution_strategy": solution_strategy}
+        super().__init__(params)
+
+        self.ux_south = ux_south
+        self.uy_south = uy_south
+        self.ux_north = ux_north
+        self.uy_north = uy_north
+        self.scalar_source_value = source_value
+
 if __name__ == "__main__":
-    TestSchurComplement().test_pull_north_positive_opening()
-#    unittest.main()
+#    TestSchurComplement().test_multiple_time_steps_thm()
+    unittest.main()
