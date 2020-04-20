@@ -14,6 +14,7 @@ import numpy as np
 import porepy as pp
 import logging
 import time
+from scipy.linalg import inv as denseinv
 import scipy.sparse as sps
 import scipy.sparse.linalg as spla
 
@@ -476,9 +477,11 @@ class ContactMechanicsBiot(contact_model.ContactMechanics):
     def after_newton_divergence(self):
         raise ValueError("Newton iterations did not converge")
 
-    def initialize_linear_solver(self):
-
+    def initialize_linear_solver(self) -> None:
+        solution_strategy = self.params.get("solution_strategy", None)
         solver = self.params.get("linear_solver", "direct")
+
+        self.solution_strategy = solution_strategy
 
         if solver == "direct":
             """ In theory, it should be possible to instruct SuperLU to reuse the
@@ -511,8 +514,7 @@ class ContactMechanicsBiot(contact_model.ContactMechanics):
         else:
             raise ValueError("unknown linear solver " + solver)
 
-    def assemble_and_solve_linear_system(self, tol):
-
+    def assemble_and_solve_linear_system(self, tol: float) -> np.ndarray:
         A, b = self.assembler.assemble_matrix_rhs()
         logger.debug("Max element in A {0:.2e}".format(np.max(np.abs(A))))
         logger.debug(
@@ -520,8 +522,16 @@ class ContactMechanicsBiot(contact_model.ContactMechanics):
                 np.max(np.sum(np.abs(A), axis=1)), np.min(np.sum(np.abs(A), axis=1))
             )
         )
-        if self.linear_solver == "direct":
-            return spla.spsolve(A, b)
+        if self.solution_strategy == "schur_complement":
+            x = self.mechanics_schur_complement(A, b)
+        elif self.linear_solver == "direct":
+            t_0 = time.time()
+            x = spla.spsolve(A, b)
+            print(
+                "Solved whole system using direct solver in {} s.".format(
+                    time.time() - t_0
+                )
+            )
         elif self.linear_solver == "pyamg":
             print("pyamg")
             g = self.gb.grids_of_dimension(self.Nd)[0]
@@ -554,4 +564,71 @@ class ContactMechanicsBiot(contact_model.ContactMechanics):
             M = sps.linalg.LinearOperator(A.shape, precond_schur)
             x, info = sps.linalg.gmres(A, b, M=M, restart=100, maxiter=10, tol=tol)
 
-            return x
+        return x
+
+    def mechanics_schur_complement(
+        self, A: sps.csr_matrix, b: np.ndarray
+    ) -> np.ndarray:
+        """ Notation (A,B,C,D,x,y,a,b) follows wikipedia on Schur Complement, with
+        mechanics corresponding to y and mpsa matrix D.
+        """
+        t_0 = time.time()
+        g = self._nd_grid()
+        assembler = self.assembler
+        mechanics_ind = assembler.block_dof[(g, self.displacement_variable)]
+        mechanics_dof = assembler.full_dof[mechanics_ind]
+        mechanics_dof = np.arange(0, mechanics_dof)
+        mortar_dof = np.setdiff1d(np.arange(b.size), mechanics_dof)
+
+        A_el_m = A[mechanics_dof, :][:, mortar_dof]  # C
+        C = A_el_m
+        A_m_el = A[mortar_dof, :][:, mechanics_dof]  # B
+        B = A_m_el
+        A_m_m = A[mortar_dof, :][:, mortar_dof]  # A
+        A1 = A_m_m
+        A_el_el = A[mechanics_dof, :][:, mechanics_dof]  # D
+        D = A_el_el
+        t_1 = time.time()
+        if not hasattr(self, "Dinv"):
+            print("Computing SC of D:")
+
+            ddenseinv = denseinv(D.todense())
+            tinv = time.time()
+            print("Inverting D as a dense matrix took {} s".format(tinv - t_1))
+            self.Dinv = sps.csr_matrix(ddenseinv)
+            ta = time.time()
+            print("Converting to csr took {} s.".format(ta - tinv))
+            self.BDinv = B * self.Dinv
+            tb = time.time()
+            print("Left-multiplying by B took", tb - ta)
+            self.BDinvC = self.BDinv * C
+            tc = time.time()
+            print(
+                "Right-multiplying by C took {} s. Finished computing SC.".format(
+                    tc - tb
+                )
+            )
+
+        t_2 = time.time()
+        to_inv = A1 - self.BDinvC
+        t_3 = time.time()
+
+        b_m = b[mortar_dof]  # a
+        b_el = b[mechanics_dof]  # b
+        b_2 = b_m - self.BDinv * b_el
+        t_4 = time.time()
+        m = spla.spsolve(to_inv, b_2)
+        t_5 = time.time()
+        u = self.Dinv * (b_el - C * m)
+        t_6 = time.time()
+        x = np.zeros_like(b)
+        x[mechanics_dof] = u
+        x[mortar_dof] = m
+        t_7 = time.time()
+        #    print("2", t_2-t_1, "\n3 matrix prod", t_3-t_2, "4 vector ", t_4-t_3, "\n5spsolve", t_5-t_4)
+        print(
+            "Solved in {} s, with {} for constant part, whereof {} s were the inversion of the SC.".format(
+                t_7 - t_0, t_7 - t_2, t_5 - t_4
+            )
+        )
+        return x
